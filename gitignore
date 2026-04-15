@@ -1,0 +1,9 @@
+node_modules/
+cdk/cdk.out/
+cdk/*.js
+cdk/*.d.js
+__pycache__/
+*.pyc
+.env
+.DS_Store
+*.zip

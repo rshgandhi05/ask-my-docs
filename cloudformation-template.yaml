@@ -1,0 +1,327 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Ask My Docs — Serverless RAG on AWS.
+  Upload this file to CloudFormation, click Deploy, done.
+  When finished: Actions > Delete Stack to remove everything.
+
+Parameters:
+  IndexName:
+    Type: String
+    Default: ask-my-docs
+    Description: OpenSearch index name (leave as default)
+
+Resources:
+
+  # ── S3 Bucket (the filing cabinet for your PDFs) ──────────────────────────
+  PdfBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "ask-my-docs-pdfs-${AWS::AccountId}"
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: ".pdf"
+            Function: !GetAtt IngestLambda.Arn
+
+  # Allow S3 to invoke the ingest Lambda
+  S3InvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt IngestLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub "arn:aws:s3:::ask-my-docs-pdfs-${AWS::AccountId}"
+
+  # ── OpenSearch Serverless (the smart vector index) ────────────────────────
+  EncryptionPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: ask-my-docs-enc
+      Type: encryption
+      Policy: !Sub >
+        {"Rules":[{"ResourceType":"collection","Resource":["collection/ask-my-docs"]}],"AWSOwnedKey":true}
+
+  NetworkPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: ask-my-docs-net
+      Type: network
+      Policy: >
+        [{"Rules":[{"ResourceType":"collection","Resource":["collection/ask-my-docs"]},{"ResourceType":"dashboard","Resource":["collection/ask-my-docs"]}],"AllowFromPublic":true}]
+
+  VectorCollection:
+    Type: AWS::OpenSearchServerless::Collection
+    DependsOn:
+      - EncryptionPolicy
+      - NetworkPolicy
+    Properties:
+      Name: ask-my-docs
+      Type: VECTORSEARCH
+
+  # ── IAM Role for both Lambdas ─────────────────────────────────────────────
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ask-my-docs-lambda-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AskMyDocsPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: BedrockModels
+                Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource:
+                  - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v1"
+                  - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-3-haiku-20240307-v1:0"
+              - Sid: S3Read
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::ask-my-docs-pdfs-${AWS::AccountId}"
+                  - !Sub "arn:aws:s3:::ask-my-docs-pdfs-${AWS::AccountId}/*"
+              - Sid: OpenSearch
+                Effect: Allow
+                Action: aoss:APIAccessAll
+                Resource: !GetAtt VectorCollection.Arn
+
+  # ── OpenSearch data access policy (let the Lambda role read/write) ────────
+  DataAccessPolicy:
+    Type: AWS::OpenSearchServerless::AccessPolicy
+    Properties:
+      Name: ask-my-docs-access
+      Type: data
+      Policy: !Sub >
+        [{"Rules":[{"ResourceType":"index","Resource":["index/ask-my-docs/*"],"Permission":["aoss:CreateIndex","aoss:WriteDocument","aoss:ReadDocument","aoss:DescribeIndex"]},{"ResourceType":"collection","Resource":["collection/ask-my-docs"],"Permission":["aoss:CreateCollectionItems","aoss:DescribeCollectionItems"]}],"Principal":["${LambdaRole.Arn}"]}]
+
+  # ── Ingest Lambda (runs when PDF lands in S3) ─────────────────────────────
+  IngestLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ask-my-docs-ingest
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 300
+      MemorySize: 1024
+      Environment:
+        Variables:
+          OPENSEARCH_ENDPOINT: !GetAtt VectorCollection.CollectionEndpoint
+          INDEX_NAME: !Ref IndexName
+      Code:
+        ZipFile: |
+          import json, os, boto3, hashlib, urllib3
+          from io import BytesIO
+
+          s3 = boto3.client("s3")
+          bedrock = boto3.client("bedrock-runtime")
+          CHUNK_SIZE, OVERLAP = 500, 100
+
+          def extract_text(pdf_bytes):
+              try:
+                  import pypdf
+                  reader = pypdf.PdfReader(BytesIO(pdf_bytes))
+                  return "\n\n".join(p.extract_text() or "" for p in reader.pages)
+              except Exception:
+                  # fallback: basic text extraction without pypdf
+                  text = pdf_bytes.decode("latin-1", errors="ignore")
+                  lines = [l.strip() for l in text.split("\n") if len(l.strip()) > 20]
+                  return "\n".join(lines)
+
+          def chunk_text(text):
+              chunks, start = [], 0
+              while start < len(text):
+                  end = min(start + CHUNK_SIZE, len(text))
+                  c = text[start:end].strip()
+                  if len(c) > 50:
+                      chunks.append(c)
+                  start += CHUNK_SIZE - OVERLAP
+              return chunks
+
+          def embed(text):
+              r = bedrock.invoke_model(
+                  modelId="amazon.titan-embed-text-v1",
+                  contentType="application/json", accept="application/json",
+                  body=json.dumps({"inputText": text[:8000]})
+              )
+              return json.loads(r["body"].read())["embedding"]
+
+          def store(chunk, vec, doc_id, idx, source):
+              import botocore.session
+              from botocore.auth import SigV4Auth
+              from botocore.awsrequest import AWSRequest
+              creds = botocore.session.get_session().get_credentials().get_frozen_credentials()
+              endpoint = os.environ["OPENSEARCH_ENDPOINT"].replace("https://","")
+              index = os.environ["INDEX_NAME"]
+              doc = {"text": chunk, "embedding": vec, "source": source, "chunk_index": idx, "doc_id": doc_id}
+              url = f"https://{endpoint}/{index}/_doc/{doc_id}_{idx}"
+              req = AWSRequest(method="PUT", url=url, data=json.dumps(doc), headers={"Content-Type":"application/json"})
+              SigV4Auth(creds, "aoss", os.environ.get("AWS_REGION","us-east-1")).add_auth(req)
+              http = urllib3.PoolManager()
+              resp = http.request("PUT", url, body=json.dumps(doc).encode(), headers=dict(req.headers))
+              if resp.status >= 300:
+                  print(f"Store failed: {resp.status} {resp.data[:200]}")
+
+          def handler(event, context):
+              for rec in event["Records"]:
+                  bucket = rec["s3"]["bucket"]["name"]
+                  key = rec["s3"]["object"]["key"]
+                  print(f"Processing: {key}")
+                  pdf_bytes = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+                  text = extract_text(pdf_bytes)
+                  chunks = chunk_text(text)
+                  doc_id = hashlib.md5(key.encode()).hexdigest()[:12]
+                  print(f"Chunked into {len(chunks)} pieces")
+                  for i, chunk in enumerate(chunks):
+                      vec = embed(chunk)
+                      store(chunk, vec, doc_id, i, key)
+                  print(f"Done: {key}")
+              return {"status": "ok"}
+
+  # ── Query Lambda (called by API Gateway) ──────────────────────────────────
+  QueryLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ask-my-docs-query
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 30
+      MemorySize: 512
+      Environment:
+        Variables:
+          OPENSEARCH_ENDPOINT: !GetAtt VectorCollection.CollectionEndpoint
+          INDEX_NAME: !Ref IndexName
+      Code:
+        ZipFile: |
+          import json, os, boto3, urllib3
+
+          bedrock = boto3.client("bedrock-runtime")
+          EMBED_MODEL = "amazon.titan-embed-text-v1"
+          GEN_MODEL = "anthropic.claude-3-haiku-20240307-v1:0"
+          TOP_K = 5
+
+          def embed(text):
+              r = bedrock.invoke_model(
+                  modelId=EMBED_MODEL,
+                  contentType="application/json", accept="application/json",
+                  body=json.dumps({"inputText": text})
+              )
+              return json.loads(r["body"].read())["embedding"]
+
+          def search(vec):
+              import botocore.session
+              from botocore.auth import SigV4Auth
+              from botocore.awsrequest import AWSRequest
+              creds = botocore.session.get_session().get_credentials().get_frozen_credentials()
+              endpoint = os.environ["OPENSEARCH_ENDPOINT"].replace("https://","")
+              index = os.environ["INDEX_NAME"]
+              body = {"size": TOP_K, "_source": ["text"], "query": {"knn": {"embedding": {"vector": vec, "k": TOP_K}}}}
+              url = f"https://{endpoint}/{index}/_search"
+              req = AWSRequest(method="POST", url=url, data=json.dumps(body), headers={"Content-Type":"application/json"})
+              SigV4Auth(creds, "aoss", os.environ.get("AWS_REGION","us-east-1")).add_auth(req)
+              http = urllib3.PoolManager()
+              resp = http.request("POST", url, body=json.dumps(body).encode(), headers=dict(req.headers))
+              hits = json.loads(resp.data).get("hits",{}).get("hits",[])
+              return [h["_source"]["text"] for h in hits]
+
+          def answer(question, chunks):
+              ctx = "\n\n---\n\n".join(chunks)
+              prompt = f"Use ONLY the context below. If the answer is not there, say so.\n\nCONTEXT:\n{ctx}\n\nQUESTION:\n{question}\n\nANSWER:"
+              r = bedrock.invoke_model(
+                  modelId=GEN_MODEL,
+                  contentType="application/json", accept="application/json",
+                  body=json.dumps({"anthropic_version":"bedrock-2023-05-31","max_tokens":1024,"messages":[{"role":"user","content":prompt}]})
+              )
+              return json.loads(r["body"].read())["content"][0]["text"]
+
+          def handler(event, context):
+              try:
+                  body = json.loads(event.get("body") or "{}")
+                  question = body.get("question","").strip()
+                  if not question:
+                      return {"statusCode":400,"body":json.dumps({"error":"missing question"}),"headers":{"Content-Type":"application/json"}}
+                  vec = embed(question)
+                  chunks = search(vec)
+                  if not chunks:
+                      return {"statusCode":200,"body":json.dumps({"answer":"No content found. Upload a PDF first."}),"headers":{"Content-Type":"application/json"}}
+                  ans = answer(question, chunks)
+                  return {"statusCode":200,"body":json.dumps({"answer":ans,"chunks_used":len(chunks)}),"headers":{"Content-Type":"application/json","Access-Control-Allow-Origin":"*"}}
+              except Exception as e:
+                  print(f"Error: {e}")
+                  return {"statusCode":500,"body":json.dumps({"error":str(e)}),"headers":{"Content-Type":"application/json"}}
+
+  # ── API Gateway ───────────────────────────────────────────────────────────
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: ask-my-docs-api
+
+  QueryResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: query
+
+  QueryMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref QueryResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${QueryLambda.Arn}/invocations"
+
+  ApiGatewayPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt QueryLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/POST/query"
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: QueryMethod
+    Properties:
+      RestApiId: !Ref RestApi
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref RestApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: prod
+
+# ── Outputs (shown after deploy) ──────────────────────────────────────────
+Outputs:
+  BucketName:
+    Description: "Upload your PDFs here (AWS Console > S3 > this bucket > Upload)"
+    Value: !Ref PdfBucket
+
+  ApiUrl:
+    Description: "Your query endpoint — POST JSON with a question field"
+    Value: !Sub "https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/prod/query"
+
+  HowToTest:
+    Description: "Quick test command (replace URL and bucket from above)"
+    Value: !Sub "aws s3 cp my.pdf s3://${PdfBucket}/ && curl -X POST https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/prod/query -H 'Content-Type: application/json' -d '{\"question\": \"What is this document about?\"}'"
