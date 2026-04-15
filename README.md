@@ -1,4 +1,4 @@
-# Ask My Docs — Serverless RAG on AWS
+# Ask My Docs- Serverless RAG on AWS
 
 > Built and documented by an AWS Community Builder. Read the full blog post on Medium: [link after publishing]
 
