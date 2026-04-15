@@ -149,10 +149,6 @@ PUT /ask-my-docs
 
 ## Blog Post
 
-Read the full walkthrough on Medium: [link after publishing]
+Read the full walkthrough on Medium
 
 ---
-
-## License
-
-MIT
