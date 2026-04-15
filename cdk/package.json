@@ -1,0 +1,22 @@
+{
+  "name": "ask-my-docs-cdk",
+  "version": "0.1.0",
+  "bin": {
+    "app": "bin/app.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w",
+    "cdk": "cdk"
+  },
+  "devDependencies": {
+    "aws-cdk": "2.140.0",
+    "typescript": "~5.4.0",
+    "@types/node": "20.12.12",
+    "ts-node": "^10.9.2"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "2.140.0",
+    "constructs": "^10.0.0"
+  }
+}
