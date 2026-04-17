@@ -1,7 +1,5 @@
 # Ask My Docs- Serverless RAG on AWS
 
-> Built and documented by an AWS Community Builder. Read the full blog post on Medium: https://medium.com/@rshgandhi05/ask-my-docs-i-built-a-serverless-rag-system-on-aws-that-costs-0-when-youre-not-using-it-2cf0f4137005
-
 > Chat with any PDF using 100% serverless AWS infrastructure. Upload a doc, ask questions, get answers grounded in your content. Spin it up in minutes, destroy it just as fast.
 
 Built by an AWS Community Builder as a demo of event-driven, serverless RAG architecture using AWS CDK.
@@ -149,6 +147,6 @@ PUT /ask-my-docs
 
 ## Blog Post
 
-Read the full walkthrough on Medium
+Read the full walkthrough on Medium https://medium.com/@rshgandhi05/ask-my-docs-i-built-a-serverless-rag-system-on-aws-that-costs-0-when-youre-not-using-it-2cf0f4137005 
 
 ---
